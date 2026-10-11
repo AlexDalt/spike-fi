@@ -1,36 +1,36 @@
 export GCC_PREFIX  = ${RISCV}/bin/riscv64-unknown-elf-
 
 export GCC_FLAGS  += -march='rv32imafdc_zicsr_zifencei_zicntr' -mabi='ilp32' -DXLEN='32'
-export GCC_PATHS  += 
-export GCC_LIBS   += 
+export GCC_PATHS  += -I ${REPO_HOME}
+export GCC_LIBS   +=
 
-${REPO_HOME}/build/test.o    : test.c test.h
+BUILD_DIR = ${REPO_HOME}/build/sum
+
+${BUILD_DIR}:
+	@mkdir -p ${BUILD_DIR}
+
+${BUILD_DIR}/test.o    : test.c test.h | ${BUILD_DIR}
 	@${GCC_PREFIX}gcc ${GCC_FLAGS} ${GCC_PATHS} $(addprefix -I ,${INCLUDES}) -Wall -std='gnu99' -O3 -c -o ${@} $(filter-out %.h, ${^}) ${GCC_LIBS}
-${REPO_HOME}/build/test.elf  : ${REPO_HOME}/build/test.o
+${BUILD_DIR}/test.elf  : ${BUILD_DIR}/test.o
 	@${GCC_PREFIX}gcc ${GCC_FLAGS} ${GCC_PATHS} $(addprefix -I ,${INCLUDES}) -Wall -std='gnu99' -O3    -o ${@}                   ${^}  ${GCC_LIBS}
 
-${REPO_HOME}/build/test.bin  : ${REPO_HOME}/build/test.elf
+${BUILD_DIR}/test.bin  : ${BUILD_DIR}/test.elf
 	@${GCC_PREFIX}objcopy --output-target='binary' ${<}   ${@}
-${REPO_HOME}/build/test.asm  : ${REPO_HOME}/build/test.elf
+${BUILD_DIR}/test.asm  : ${BUILD_DIR}/test.elf
 	@${GCC_PREFIX}objdump --disassemble-all        ${<} > ${@}
-${REPO_HOME}/build/test.size : ${REPO_HOME}/build/test.elf
+${BUILD_DIR}/test.size : ${BUILD_DIR}/test.elf
 	@${GCC_PREFIX}size -G -d                       ${<} > ${@}
 
-build : ${REPO_HOME}/build/test.elf ${REPO_HOME}/build/test.asm
+build : ${BUILD_DIR}/test.elf ${BUILD_DIR}/test.asm
 
-run   : ${REPO_HOME}/build/test.elf
+run   : ${BUILD_DIR}/test.elf
 	${RISCV}/bin/spike    --isa='rv32imafdc_zicsr_zifencei_zicntr' ${FI} ${RISCV}/riscv32-unknown-elf/bin/pk ${<}
 
-debug : ${REPO_HOME}/build/test.elf
+debug : ${BUILD_DIR}/test.elf
 	${RISCV}/bin/spike -d --isa='rv32imafdc_zicsr_zifencei_zicntr' ${FI} ${RISCV}/riscv32-unknown-elf/bin/pk ${<}
 
-trace : ${REPO_HOME}/build/test.elf
+trace : ${BUILD_DIR}/test.elf
 	${RISCV}/bin/spike -l --isa='rv32imafdc_zicsr_zifencei_zicntr' ${FI} ${RISCV}/riscv32-unknown-elf/bin/pk ${<}
 
 clean :
-	@rm --force ${REPO_HOME}/build/test.o
-	@rm --force ${REPO_HOME}/build/test.elf
-
-	@rm --force ${REPO_HOME}/build/test.bin
-	@rm --force ${REPO_HOME}/build/test.asm
-	@rm --force ${REPO_HOME}/build/test.size
+	@rm --force --recursive ${BUILD_DIR}

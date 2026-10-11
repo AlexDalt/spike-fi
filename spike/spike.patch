@@ -2,7 +2,7 @@ diff --git a/riscv/cfg.cc b/riscv/cfg.cc
 index 794e9555..373dfc9b 100644
 --- a/riscv/cfg.cc
 +++ b/riscv/cfg.cc
-@@ -47,4 +47,10 @@ cfg_t::cfg_t()
+@@ -47,4 +47,11 @@ cfg_t::cfg_t()
    real_time_clint  = false;
    trigger_count    = 4;
    cache_blocksz    = 64;
@@ -11,7 +11,8 @@ index 794e9555..373dfc9b 100644
 +  fi_debug  = false;
 +  fi_trace  = false;
 +  fi_seed   = 0;
-+  fi_specs  = std::unordered_map<uint64_t,fi_spec_t>();
++  fi_specs    = std::unordered_map<uint64_t,fi_spec_t>();
++  fi_pc_specs = std::unordered_map<uint64_t,fi_spec_t>();
  }
 diff --git a/riscv/cfg.h b/riscv/cfg.h
 index 779634e9..5ee6a01b 100644
@@ -27,7 +28,7 @@ index 779634e9..5ee6a01b 100644
  class abstract_sim_if_t;
  
  typedef enum {
-@@ -80,6 +83,12 @@ public:
+@@ -80,6 +83,13 @@ public:
    reg_t                   cache_blocksz;
    std::optional<abstract_sim_if_t*> external_simulator;
  
@@ -36,6 +37,7 @@ index 779634e9..5ee6a01b 100644
 +  bool fi_trace;
 +  bool fi_seed;
 +  std::unordered_map<uint64_t,fi_spec_t> fi_specs;
++  std::unordered_map<uint64_t,fi_spec_t> fi_pc_specs;
 +
    size_t nprocs() const { return hartids.size(); }
    size_t max_hartid() const { return hartids.back(); }
@@ -45,7 +47,7 @@ new file mode 100644
 index 00000000..b654f988
 --- /dev/null
 +++ b/riscv/fi_impl.cc
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,129 @@
 +#include "fi_impl.h"
 +
 +static std::default_random_engine prg;
@@ -70,6 +72,10 @@ index 00000000..b654f988
 +
 +  if( p->get_cfg().fi_trace ) {
 +    std::cerr << "fi: trace => step = " << std::dec << p->state.fi_step << ", pc = " << std::setw( 16 ) << std::hex << pc << ", insn = " << p->get_disassembler()->disassemble( insn ) << std::endl;
++  }
++
++  if( ( insn.bits() & 0x000FFFFF ) == 0x00002013 ) {
++    std::cerr << "fi: mark => step = " << std::dec << p->state.fi_step << ", pc = " << std::setw( 16 ) << std::hex << pc << ", id = " << std::dec << insn.i_imm() << std::endl;
 +  }
 +
 +  auto spec = p->get_cfg().fi_specs.find( p->state.fi_step );
@@ -119,6 +125,53 @@ index 00000000..b654f988
 +    }
 +  }
 +
++  auto pc_spec = p->get_cfg().fi_pc_specs.find( pc );
++
++  if( pc_spec != p->get_cfg().fi_pc_specs.end() ) {
++    std::bernoulli_distribution dist( pc_spec->second.prob ); bool trigger = dist( prg );
++
++    if( p->get_cfg().fi_debug ) {
++      std::cerr << "fi: debug => matched pc_spec=" << pc_spec->second << " ~> trigger=" << trigger << std::endl;
++    }
++
++    if( trigger ) {
++      switch( pc_spec->second.type ) {
++        case SKIP : {
++          skip = true;
++
++          break;
++        }
++        case  GPR : {
++          if( p->get_cfg().fi_debug ) {
++            std::cerr << "fi: debug => >GPR[" << pc_spec->second.gpr_addr << "]=" << std::hex << READ_REG( pc_spec->second.gpr_addr ) << std::endl;
++          }
++
++          reg_t fault = 0;
++
++          switch( pc_spec->second.gpr_mode ) {
++            case ZERO : {
++              fault =  0;     break;
++            }
++            case  ONE : {
++              fault = -1;     break;
++            }
++            case RAND : {
++              fault = bits(); break;
++            }
++          }
++
++          WRITE_REG( pc_spec->second.gpr_addr, ( READ_REG( pc_spec->second.gpr_addr ) & ~pc_spec->second.gpr_mask ) | ( fault & pc_spec->second.gpr_mask ) );
++
++          if( p->get_cfg().fi_debug ) {
++            std::cerr << "fi: debug => <GPR[" << pc_spec->second.gpr_addr << "]=" << std::hex << READ_REG( pc_spec->second.gpr_addr ) << std::endl;
++          }
++
++          break;
++        }
++      }
++    }
++  }
++
 +  p->state.fi_step = p->state.fi_step + 1;
 +
 +  return skip;
@@ -157,18 +210,25 @@ new file mode 100644
 index 00000000..f17e2bab
 --- /dev/null
 +++ b/riscv/fi_spec.cc
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,95 @@
 +#include "fi_spec.h"
 +
-+void fi_spec_parse( std::unordered_map<uint64_t,fi_spec_t> &specs, const char* x ) {
-+  uint64_t step = 0; fi_spec_t spec; std::stringstream tokens( x ); std::string token;
++void fi_spec_parse( std::unordered_map<uint64_t,fi_spec_t> &specs, std::unordered_map<uint64_t,fi_spec_t> &pc_specs, const char* x ) {
++  fi_spec_t spec; std::stringstream tokens( x ); std::string token;
 +
 +  memset( &spec, 0, sizeof( fi_spec_t ) );
 +
 +  // type-agnostic, non-optional part(s)
 +
 +  getline( tokens, token, ':' );
-+       step = std::stoi( token, NULL, 10 );
++  bool by_pc = ( token == "pc" );
++  uint64_t key = 0;
++  if( by_pc ) {
++    getline( tokens, token, ':' );
++    key = std::stoull( token, NULL, 0 );
++  } else {
++    key = std::stoi( token, NULL, 10 );
++  }
 +
 +  getline( tokens, token, ':' );
 +  spec.prob = std::stof( token, NULL     );
@@ -215,7 +275,11 @@ index 00000000..f17e2bab
 +    }
 +  }
 +
-+  specs[ step ] = spec;
++  if( by_pc ) {
++    pc_specs[ key ] = spec;
++  } else {
++    specs[ key ] = spec;
++  }
 +}
 +
 +std::ostream &operator<<( std::ostream &os, const fi_spec_t &spec ) {
@@ -275,7 +339,7 @@ index 00000000..11a83cb7
 +  uint64_t  gpr_mask;
 +} fi_spec_t;
 +
-+extern void fi_spec_parse( std::unordered_map<uint64_t,fi_spec_t> &specs, const char* x );
++extern void fi_spec_parse( std::unordered_map<uint64_t,fi_spec_t> &specs, std::unordered_map<uint64_t,fi_spec_t> &pc_specs, const char* x );
 +
 +extern std::ostream &operator<<( std::ostream &os, const fi_spec_t &spec );
 +
@@ -399,7 +463,7 @@ index f62d1daf..339fd60a 100644
 +    cfg.fi_seed   = std::stoi( s );
 +  });
 +  parser.option(0, "fi-spec",   1, [&](const char       * s){
-+    fi_spec_parse( cfg.fi_specs, s );
++    fi_spec_parse( cfg.fi_specs, cfg.fi_pc_specs, s );
 +  });
 +
    auto argv1 = parser.parse(argv);
@@ -413,7 +477,7 @@ index f62d1daf..339fd60a 100644
    sim_t s(&cfg, halted,
        mems, plugin_device_factories, dtb_discovery, htif_args, dm_config, log_path, dtb_enabled, dtb_file,
        socket,
-@@ -543,6 +567,16 @@ int main(int argc, char** argv)
+@@ -543,6 +567,19 @@ int main(int argc, char** argv)
      s.set_remote_bitbang(&(*remote_bitbang));
    }
  
@@ -423,6 +487,9 @@ index f62d1daf..339fd60a 100644
 +    if( cfg.fi_debug ) {
 +      for( auto it = cfg.fi_specs.begin(); it != cfg.fi_specs.end(); it++ ) {
 +        std::cerr << "fi: debug => parsed step=" << it->first << ", " << "spec=" << it->second << std::endl;
++      }
++      for( auto it = cfg.fi_pc_specs.begin(); it != cfg.fi_pc_specs.end(); it++ ) {
++        std::cerr << "fi: debug => parsed pc=" << std::hex << it->first << ", " << "spec=" << it->second << std::endl;
 +      }
 +    }
 +  }
