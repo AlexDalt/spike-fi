@@ -1,0 +1,225 @@
+#include "test.h"
+#include <stdlib.h>
+
+/* 2013265921 = 15 * 2^27 + 1, with primitive generator 31. */
+const uint64_t FIELD_MODULUS = 2013265921ULL;
+const uint64_t FIELD_GENERATOR = 31ULL;
+volatile uint64_t *TRANSCRIPT;
+
+uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod);
+
+uint64_t modpow(uint64_t base, uint64_t exp, uint64_t mod) {
+	uint64_t result = 1;
+	base %= mod;
+	while (exp > 0) {
+		if (exp & 1)
+			result = modmul(result, base, mod);
+		exp >>= 1;
+		base = modmul(base, base, mod);
+	}
+	return result;
+}
+
+uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod) {
+	uint64_t result = 0;
+	a %= mod;
+	while (b > 0) {
+		if (b & 1) {
+			result += a;
+			if (result >= mod) result -= mod;
+		}
+		a <<= 1;
+		if (a >= mod) a -= mod;
+		b >>= 1;
+	}
+	return result;
+}
+
+uint64_t modinv(uint64_t a, uint64_t mod) {
+	return modpow(a, mod - 2, mod);
+}
+
+void bit_reverse(uint64_t* a, size_t n) {
+	for (size_t i = 1, j = 0; i < n; i++) {
+		size_t bit = n >> 1;
+		for (; j & bit; bit >>= 1)
+			j ^= bit;
+		j ^= bit;
+		if (i < j) {
+			uint64_t tmp = a[i];
+			a[i] = a[j];
+			a[j] = tmp;
+		}
+	}
+}
+
+/* Recursive Gentleman-Sande (decimation-in-frequency) NTT.  Each call mixes
+ * its two halves before descending, so the first step of the recursion is the
+ * FIRST mixing loop to execute, and the bit-reversal is applied to the output.
+ * FI_MARK( 0 ) heads every mixing loop; FI_MARK( 2 ) precedes every recursive
+ * call, so a call can be skipped by absolute step. */
+__attribute__((noinline))
+void fft_recursive(uint64_t* a, size_t n, uint64_t root, uint64_t mod) {
+	if (n <= 1) return;
+
+	size_t half = n / 2;
+	uint64_t w = 1;
+	FI_MARK( 0 );
+	for (volatile size_t j = 0; j < half; j++) {
+		uint64_t u = a[j] % mod;
+		uint64_t v = a[j + half] % mod;
+		a[j]        = (u + v) % mod;
+		a[j + half] = modmul((u + mod - v) % mod, w, mod);
+		w = modmul(w, root, mod);
+	}
+
+	uint64_t w2 = modmul(root, root, mod);
+	fft_recursive(a, half, w2, mod);
+	fft_recursive(a + half, half, w2, mod);
+}
+
+void fft(uint64_t* a, size_t n, uint64_t root, uint64_t mod) {
+	fft_recursive(a, n, root, mod);
+	bit_reverse(a, n);
+}
+
+/* The evaluation transform is kept separate so its recursive calls can be
+ * targeted without touching the interpolation. */
+__attribute__((noinline))
+void fft_eval_recursive(uint64_t* a, size_t n, uint64_t root, uint64_t mod) {
+	if (n <= 1) return;
+
+	size_t half = n / 2;
+	uint64_t w = 1;
+	for (volatile size_t j = 0; j < half; j++) {
+		uint64_t u = a[j] % mod;
+		uint64_t v = a[j + half] % mod;
+		a[j]        = (u + v) % mod;
+		a[j + half] = modmul((u + mod - v) % mod, w, mod);
+		w = modmul(w, root, mod);
+	}
+
+	uint64_t w2 = modmul(root, root, mod);
+	FI_MARK( 1 );
+	fft_eval_recursive(a, half, w2, mod);
+	FI_MARK( 2 );
+	fft_eval_recursive(a + half, half, w2, mod);
+}
+
+__attribute__((noinline))
+void fft_eval(uint64_t* a, size_t n, uint64_t root, uint64_t mod) {
+	fft_eval_recursive(a, n, root, mod);
+	bit_reverse(a, n);
+}
+
+void ifft(uint64_t* a, size_t n, uint64_t root, uint64_t mod) {
+	uint64_t inv_root = modinv(root, mod);
+	uint64_t inv_n    = modinv(n, mod);
+	fft(a, n, inv_root, mod);
+	for (size_t i = 0; i < n; i++)
+		a[i] = modmul(a[i], inv_n, mod);
+}
+
+uint64_t random_field_element(uint64_t* state) {
+	uint64_t value = *state;
+	value ^= value << 13;
+	value ^= value >> 7;
+	value ^= value << 17;
+	*state = value;
+	return value % FIELD_MODULUS;
+}
+
+// tree is a flat array of 2*n digests (each SHA256_DIGEST_SIZE bytes).
+// Leaves go at indices n..2n-1, internal nodes are built bottom-up, root at index 1.
+void merkle_tree(uint8_t* tree, const uint8_t* leaf_hashes, size_t n) {
+	for (size_t i = 0; i < n; i++)
+		memcpy(tree + (n + i) * SHA256_DIGEST_SIZE, leaf_hashes + i * SHA256_DIGEST_SIZE, SHA256_DIGEST_SIZE);
+	for (size_t i = n - 1; i >= 1; i--)
+		sha256(tree + (2 * i) * SHA256_DIGEST_SIZE, 2 * SHA256_DIGEST_SIZE, tree + i * SHA256_DIGEST_SIZE);
+}
+
+uint8_t* get_merkle_root(uint8_t* tree) {
+	return tree + SHA256_DIGEST_SIZE;
+}
+
+int main( int argc, char* argv[] ) {
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s <transcript_size>\n", argv[0]);
+		return 1;
+	}
+	size_t n            = (size_t)strtoul(argv[1], NULL, 10);
+	size_t padded_len   = n * 2;
+	size_t extended_len = padded_len * 2;
+
+	TRANSCRIPT              = malloc(n            * sizeof(uint64_t));
+	uint64_t *padded        = malloc(padded_len   * sizeof(uint64_t));
+	uint64_t *coeffs        = malloc(padded_len   * sizeof(uint64_t));
+	uint64_t *evals         = malloc(extended_len * sizeof(uint64_t));
+	uint8_t  *leaf_hashes   = malloc(extended_len * SHA256_DIGEST_SIZE);
+	uint8_t  *tree          = malloc(2 * extended_len * SHA256_DIGEST_SIZE);
+
+	// Generate Fibonacci sequence transcript
+	TRANSCRIPT[0] = 1;
+	TRANSCRIPT[1] = 1;
+	for (size_t i = 2; i < n; i++)
+		TRANSCRIPT[i] = TRANSCRIPT[i-1] + TRANSCRIPT[i-2];
+
+	printf("transcript:\n");
+	for (size_t i = 0; i < n; i++)
+		printf("  [%zu] = %llu\n", i, (unsigned long long)TRANSCRIPT[i]);
+
+	/* Concatenated padding: the private trace occupies the lower half of the
+	 * interpolation input and random padding the upper half.  A fixed seed
+	 * makes experiment runs reproducible. */
+	uint64_t random_state = 0x9e3779b97f4a7c15ULL ^ n;
+	for (size_t i = 0; i < n; i++)
+		padded[i] = TRANSCRIPT[i] % FIELD_MODULUS;
+	for (size_t i = n; i < padded_len; i++)
+		padded[i] = random_field_element(&random_state);
+
+	// Polynomial interpolation of the padded trace
+	uint64_t root_of_unity = modpow(FIELD_GENERATOR, (FIELD_MODULUS - 1) / padded_len, FIELD_MODULUS);
+
+	for (size_t i = 0; i < padded_len; i++)
+		coeffs[i] = padded[i];
+	ifft(coeffs, padded_len, root_of_unity, FIELD_MODULUS);
+
+	printf("coeffs:\n");
+	for (size_t i = 0; i < padded_len; i++)
+		printf("  [%zu] = %llu\n", i, (unsigned long long)coeffs[i]);
+
+	// Evaluate on extended domain
+	uint64_t extended_root = modpow(FIELD_GENERATOR, (FIELD_MODULUS - 1) / extended_len, FIELD_MODULUS);
+	for (size_t i = 0; i < padded_len; i++)
+		evals[i] = coeffs[i];
+	for (size_t i = padded_len; i < extended_len; i++)
+		evals[i] = 0;
+	fft_eval(evals, extended_len, extended_root, FIELD_MODULUS);
+
+	// Merkle commit
+	for (size_t i = 0; i < extended_len; i++) {
+		uint8_t bytes[32] = {0};
+		for (int j = 0; j < 8; j++)
+			bytes[j] = (uint8_t)(evals[i] >> (j * 8));
+		sha256(bytes, 32, leaf_hashes + i * SHA256_DIGEST_SIZE);
+	}
+	merkle_tree(tree, leaf_hashes, extended_len);
+	uint8_t* merkle_root = get_merkle_root(tree);
+
+	printf("merkle root: ");
+	for (int i = 0; i < SHA256_DIGEST_SIZE; i++)
+		printf("%02x", merkle_root[i]);
+	printf("\n");
+
+	printf("evals:\n");
+	for (size_t i = 0; i < extended_len; i++)
+		printf("  [%zu] = %llu\n", i, (unsigned long long)evals[i]);
+
+	free((void *)TRANSCRIPT);
+	free(padded);
+	free(coeffs);
+	free(evals);
+	free(leaf_hashes);
+	free(tree);
+	return 0;
+}
