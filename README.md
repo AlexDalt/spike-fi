@@ -2,6 +2,49 @@
 
 <!--- ==================================================================== --->
 
+## Overview
+
+Although the concept of
+[fault injection (or induction)](https://en.wikipedia.org/wiki/Fault_injection)
+can be viewed as related to hardware and software testing, within the
+context of cryptography it refers to a class of active implementation 
+attack.
+The idea is that an attacker somehow actively influence execution of a 
+target device, e.g., via mechanisms which include
+clock glitches, over- or under-supply of power, electro-magnetic pulses, etc.,
+in such a way that a "useful" fault is caused.
+That is, the target device behaves in some way that is advantageous to 
+the attacker; this behaviour is used to support an associated attack,
+including goals such as recovery of cryptographic key material.
+
+Advances in cryptographic fault injection attacks span two aspects,
+namely an
+experimental aspect, i.e., the concrete mechanism for injection of faults with given properties,
+and
+  analytical aspect, i.e., how one leverages that ability to satisfy the attack goal.
+Within this field, tools which support simulated fault injection can
+therefore be useful; such tools allow one to decouple the two aspects,
+e.g., allowing progress with the analytical aspect independently from
+the experimental aspect.
+[Adhikary et al.](https://eprint.iacr.org/2024/1944.pdf)
+survey and classify related tools, among which are type-S4 instances:
+these simulate execution of
+"*a binary file [...] compiled for a specific target*".
+Various simulators of this type exist, for various 
+[ISAs](https://en.wikipedia.org/wiki/Instruction_set_architecture).
+
+`spike-fi`
+is one further example: it focuses on the 
+[RISC-V](https://en.wikipedia.org/wiki/RISC-V)
+ISA, using the 
+[`spike`](https://github.com/riscv-software-src/riscv-isa-sim)
+instruction set simulator as a basis.
+Note that alternatives exist: see, for example
+the [gem5](https://www.gem5.org)-based [InjectV](https://arxiv.org/pdf/2606.12011)
+tool.
+
+<!--- ==================================================================== --->
+
 # Configure
 
 1. Clone the repo.
