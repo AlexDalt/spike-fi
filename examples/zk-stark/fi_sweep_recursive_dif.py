@@ -40,14 +40,16 @@ CONFIG = {
         },
         {
             # The sibling call is in tail position, so it is compiled into a
-            # loop back edge; skipping that edge drops it.  Its marker only
-            # heads the top-level occurrence once the first call is gone, so
-            # this fault is attempted only when that one landed.
+            # loop back edge; skipping that edge drops it.  Its marker fires
+            # once per node, after that node's first child returns, so the
+            # root's occurrence heads the list only when the first call was
+            # skipped; otherwise the lower subtree emits 2n-1 markers first.
             "function": "fft_eval_recursive",
             "mark": 2,
             "kind": "skip",
-            "stage": lambda marks: marks[0],
-            "requires": 1,
+            "stage_for": lambda marks, landed, size: (
+                marks[0] if landed & 0b10 else marks[2 * size - 1]
+            ),
         },
     ],
 }

@@ -562,6 +562,12 @@ def discover_faults(transcript_size, descriptors):
             register, distance = located[index]
             if "resolve" in descriptor:
                 step = descriptor["resolve"](transcript_size, applied)
+            elif "stage_for" in descriptor:
+                # the occurrence that heads the intended site can depend on
+                # which earlier faults landed
+                step = descriptor["stage_for"](
+                    marks[descriptor["mark"]], prior_mask, transcript_size
+                ) + distance
             else:
                 step = descriptor["stage"](marks[descriptor["mark"]]) + distance
             specs[key] = fault_spec(descriptor, step, register, transcript_size)
