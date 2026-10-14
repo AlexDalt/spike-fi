@@ -47,6 +47,7 @@ faults landing unchanged.
 import os
 import random
 import re
+import signal
 import subprocess
 
 EXAMPLE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -428,6 +429,72 @@ def discover_gather_bound(function, mark_id):
     raise RuntimeError(f"could not find the gather loop in {function}")
 
 
+def discover_gather_back_edge(function, mark_id):
+    """Address of the back edge closing the gather loop after FI_MARK( mark_id )."""
+    with open(ASM_PATH, "r", encoding="utf-8") as asm_file:
+        body = function_body(asm_file.readlines(), function)
+
+    mark = re.compile(rf"\bslti\s+zero,zero,{mark_id}\b")
+    instruction = re.compile(r"\s*([0-9a-f]+):\s+[0-9a-f]+\s")
+    stride = re.compile(r"\baddi\s+([a-z0-9]+),\1,16\b")
+    back_edge = re.compile(r"\bbne\s+([a-z0-9]+),([a-z0-9]+),")
+
+    marked = False
+    walker = None
+    for line in body:
+        if not marked:
+            marked = bool(mark.search(line))
+            continue
+        found = instruction.match(line)
+        if not found:
+            continue
+        if stride.search(line):
+            walker = stride.search(line).group(1)
+        edge = back_edge.search(line)
+        if edge and walker in edge.groups():
+            return int(found.group(1), 16)
+
+    raise RuntimeError(f"could not find the gather back edge in {function}")
+
+
+def trace_step(pc, occurrence, transcript_size, applied=()):
+    """
+    Step at which the given address executes for the occurrence-th time.
+
+    Some faults have to be aimed at one iteration of a loop whose body calls
+    data-dependent helpers, so the step cannot be derived from a marker and an
+    instruction count.  The run is traced and the occurrences counted instead;
+    the trace is abandoned as soon as the wanted one appears.
+    """
+    pattern = re.compile(rf"fi: trace => step = (\d+), pc =\s+{pc:x},")
+    arguments = ["--fi-enable", "--fi-debug", "--fi-trace"]
+    arguments += [f"--fi-spec={spec}" for spec in applied]
+    process = subprocess.Popen(
+        ["make", "run", f"TRANSCRIPT_SIZE={transcript_size}",
+         "FI=" + " ".join(arguments)],
+        cwd=EXAMPLE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True,
+    )
+    seen = 0
+    try:
+        for line in process.stdout:
+            found = pattern.search(line)
+            if not found:
+                continue
+            seen += 1
+            if seen == occurrence:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait()
+                return int(found.group(1))
+        process.wait()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait()
+
+    raise RuntimeError(f"address {pc:#x} did not execute {occurrence} times")
+
+
 def locate(descriptor):
     """Resolve the faulted register, if any, and the mark-relative distance."""
     if descriptor["kind"] == "skip":
@@ -461,7 +528,10 @@ def discover_faults(transcript_size, descriptors):
     outcomes: a run is made with each reachable subset of the earlier faults
     applied, and the steps of the remaining faults are read from its markers.
     """
-    located = [locate(descriptor) for descriptor in descriptors]
+    located = [
+        (None, None) if "resolve" in descriptor else locate(descriptor)
+        for descriptor in descriptors
+    ]
     count = len(descriptors)
     specs = {}
 
@@ -490,7 +560,10 @@ def discover_faults(transcript_size, descriptors):
             if key in specs:
                 continue
             register, distance = located[index]
-            step = descriptor["stage"](marks[descriptor["mark"]]) + distance
+            if "resolve" in descriptor:
+                step = descriptor["resolve"](transcript_size, applied)
+            else:
+                step = descriptor["stage"](marks[descriptor["mark"]]) + distance
             specs[key] = fault_spec(descriptor, step, register, transcript_size)
 
     return {

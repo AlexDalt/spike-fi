@@ -4,23 +4,25 @@ Concatenated-padding fault-injection sweep against the recursive DIT NTT.
 
 Rather than stopping the padding from mixing, this attack stops it being read.
 Each call gathers its input by parity into two buffers, walking the array in
-pair-sized strides until a walking pointer meets a bound computed once before
-the loop.  A single-bit upset on that bound, at the first recursion step, pulls
-it back by half the array: the gather copies the private trace and stops, and
-the padding never enters the computation.
+pair-sized strides until a walking pointer meets a bound computed before the
+loop.  One instruction skip removes the loop's back edge at the iteration that
+has just copied the last private element: control falls through instead of
+looping, the gather stops at the midpoint of the padded transcript, and the
+padding never enters the computation.
 
 Everything else runs honestly on the parity split of [trace | 0 ... 0], so the
 prover produces exactly the commitment of an unblinded prover - which is why
-one fault is enough.  There is no padding left for the batch evaluation to
-reintroduce, so the evaluation transform needs no fault at all and still emits
-trace-derived data.  Three quarters of the committed positions then depend on
-the private trace, and the trace itself appears verbatim at every other
-position of the first half.
+one fault is enough.  No padding is left for the batch evaluation to
+reintroduce, so that transform needs no fault and still emits trace-derived
+data.  Three quarters of the committed positions then depend on the private
+trace, and the trace appears verbatim at every other position of the first
+half.
 
-The bit to clear is the one worth 8n bytes: smaller bits leave the bound
-unreachable by the stride, larger ones stop the gather before any trace is
-read.  Under interleaved padding the same truncation captures alternating trace
-and padding, so the attack is specific to the concatenated layout.
+The back edge executes once per gathered pair and its body calls
+data-dependent helpers, so the step of the wanted iteration is found by
+counting occurrences in a trace rather than from a marker offset.  Attacking
+the loop's continuation rather than its bound keeps the fault independent of
+where the allocator placed the array.
 """
 
 import ct_fi
@@ -38,10 +40,15 @@ CONFIG = {
         {
             "function": "fft",
             "mark": 3,
-            "kind": "bound",
-            "stage": lambda marks: marks[0],
-            "mask": lambda transcript_size: f"{8 * transcript_size:08x}",
-            "mode": "0",
+            "kind": "skip",
+            # the gather consumes a pair per iteration, so the private trace is
+            # complete after half of them
+            "resolve": lambda transcript_size, applied: ct_fi.trace_step(
+                ct_fi.discover_gather_back_edge("fft", 3),
+                transcript_size // 2,
+                transcript_size,
+                applied,
+            ),
         },
     ],
 }
